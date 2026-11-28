@@ -134,10 +134,15 @@ class S9ComparisonRegistryContractTest {
         fun fg() { process.lifecycle.currentState = Lifecycle.State.STARTED; drain() }
         fun sync() = registry.onSyncAlerts()
         fun counts() = listOf(banks.calls.size, sources.calls.size, comparisons.calls.size)
-        fun answer(v: Int) {
+        fun inflight() = listOf(banks.inflight, sources.inflight, comparisons.inflight)
+        fun answerBankSource(v: Int) {
             banks.answer(listOf(AlertSetting(v, identity.uid, "hana", "usd-krw", AlertCondition.ABOVE, 1401.0, true, false, stamp, stamp, null, null)))
             sources.answer(listOf(SourceAlertSetting(v+10, identity.uid, "upbit", "usdt-krw", AlertCondition.ABOVE, 1402.0, true, false, null, stamp, stamp, null)))
-            comparisons.answer(listOf(row(v+20, "tether", "signed"), row(v+30, "tether"), row(90).copy(leftSource = "krx"),
+        }
+        fun answerComparison(rows: List<ComparisonAlertSetting>) = comparisons.answer(rows)
+        fun answer(v: Int) {
+            answerBankSource(v)
+            answerComparison(listOf(row(v+20, "tether", "signed"), row(v+30, "tether"), row(90).copy(leftSource = "krx"),
                 row(91).copy(userId = "other"), row(92), row(92).copy(userId = "other")).map {
                     if (it.userId == a1.uid) it.copy(userId = identity.uid) else it
                 })
@@ -148,7 +153,14 @@ class S9ComparisonRegistryContractTest {
     private fun confirmed(id: AuthIdentityFence) = OwnedPremiumAccess(id.uid, id.authGeneration, PremiumAccessState.PremiumConfirmed)
     private fun TestScope.rig(block: Rig.() -> Unit) {
         val rig = Rig(this)
-        try { rig.block() } finally { rig.scope.cancel(); runCurrent(); assertEquals(listOf(0, 0, 0), rig.writerCalls.toList()) }
+        try {
+            rig.block()
+        } finally {
+            rig.scope.cancel()
+            (rig.banks.calls + rig.sources.calls + rig.comparisons.calls).forEach { it.cancel() }
+            runCurrent()
+            assertEquals(listOf(0, 0, 0), rig.writerCalls.toList())
+        }
     }
 
     private inline fun <reified T> unused(): T = T::class.java.cast(
@@ -404,5 +416,70 @@ class S9ComparisonRegistryContractTest {
                 }
             }
         }
+    }
+
+    @Test fun B08_sameIdentityAdoptsEditedRowsInServerOrder() = runTest {
+        rig {
+            val cold = startReplacement("B08")
+            val replacement = listOf(cold[1].copy(threshold = 6.5, isEnabled = false),
+                row(45, "tether", "signed"), cold[0])
+            val adopted = finishReplacement("B08", replacement)
+            assertEquals("B08 유지 ID 편집과 서버 순서 채택", replacement, adopted.rows)
+            verifyQuiet("B08")
+        }
+    }
+
+    @Test fun B09_sameIdentityAdoptsEmptyReady() = runTest {
+        rig {
+            startReplacement("B09")
+            val adopted = finishReplacement("B09", emptyList())
+            assertEquals("B09 비어 있는 정본 Ready 채택", List(3) { emptyList<ComparisonAlertSetting>() },
+                listOf(adopted.rows, adopted.project("tether", "absolute"), adopted.project("tether", "signed")))
+            verifyQuiet("B09")
+        }
+    }
+
+    private fun Rig.startReplacement(case: String): List<ComparisonAlertSetting> {
+        val cold = listOf(row(21, "tether", "signed"), row(31, "tether"), row(41, "tether", "signed"))
+        val one = listOf(1, 1, 1)
+        val two = listOf(2, 2, 2)
+        start()
+        assertEquals("$case 세 family GET 각 1 증가", one to one, counts() to inflight())
+        answerBankSource(1)
+        answerComparison(cold)
+        drain()
+        val before = comparison.state.value
+        test.advanceTimeBy(1)
+        S86Entry.push(golden("sync-alerts"), true, { resolves++; registry }, {}, {})
+        drain()
+        assertEquals("$case 세 family GET 각 1 증가", Triple(two, one, 1), Triple(counts(), inflight(), resolves))
+
+        fun sample() = comparison.state.value.let { Triple(it.identity, it.phase, it.adopted?.rows) }
+        val barrier = sample()
+        answerBankSource(2)
+        drain()
+        val expected = Triple(a1, AlertLoadPhase.Ready, cold)
+        assertEquals("$case 응답 전 기존 행 유지",
+            listOf(expected, expected, expected, listOf(0, 0, 1), listOf(2), listOf(12)),
+            listOf(Triple(before.identity, before.phase, before.adopted?.rows), barrier, sample(), inflight(),
+                bank.state.value.settings?.map { it.id }, source.state.value.settings?.map { it.id }))
+        return cold
+    }
+
+    private fun Rig.finishReplacement(case: String, rows: List<ComparisonAlertSetting>): ComparisonAlertRowPolicy.Adopted {
+        answerComparison(rows)
+        drain()
+        val state = comparison.state.value
+        assertEquals("$case 동일 신원 Ready", Triple(a1, AlertLoadPhase.Ready, true),
+            Triple(state.identity, state.phase, state.adopted != null))
+        return requireNotNull(state.adopted)
+    }
+
+    private fun Rig.verifyQuiet(case: String) {
+        test.advanceTimeBy(60_000)
+        drain()
+        val zero = listOf(0, 0, 0)
+        assertEquals("$case 60초 추가 GET·미결 0", Triple(listOf(2, 2, 2), zero, zero),
+            Triple(counts(), inflight(), writerCalls.toList()))
     }
 }

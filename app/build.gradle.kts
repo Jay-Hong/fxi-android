@@ -577,6 +577,8 @@ tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
         .withPropertyName("e5dJourneyJ16GoldenCopies").withPathSensitivity(org.gradle.api.tasks.PathSensitivity.RELATIVE)
     inputs.file(rootProject.file("e5dJourney/src/main/kotlin/com/jay/fxi/e5djourney/test/J17SourceFcmReturnAndTapTest.kt"))
         .withPropertyName("e5dJourneyJ17GoldenCopies").withPathSensitivity(org.gradle.api.tasks.PathSensitivity.RELATIVE)
+    inputs.file(rootProject.file("e5dJourney/src/main/kotlin/com/jay/fxi/e5djourney/test/J19ComparisonDeliveryJourneyTest.kt"))
+        .withPropertyName("e5dJourneyJ19GoldenCopies").withPathSensitivity(org.gradle.api.tasks.PathSensitivity.RELATIVE)
     // The names of every Gradle script in the repository (`s7e5dj_j2a.codex.r3.md` C), walked as the structure test walks
     // them — build and tool directories skipped, links not followed, names only — so a script added or removed anywhere reruns it.
     inputs.property("e5dJourneyRepoScripts", provider { e5dJourneyRepoScripts() })

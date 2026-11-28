@@ -59,8 +59,9 @@ class E5dJourneyJ13GoldenDataTest {
 
     @Test
     fun theJourneysCopiesAreTheGoldensData() {
-        assertEquals("J13, J14, J16 and J17 copies", listOf(
-            setOf("ONCE", "REPEAT", "SYNC"), setOf("ONCE", "SYNC"), setOf("ONCE", "KRX_REPEAT", "SYNC"), setOf("ONCE", "SYNC")
+        assertEquals("J13, J14, J16, J17 and J19 copies", listOf(
+            setOf("ONCE", "REPEAT", "SYNC"), setOf("ONCE", "SYNC"), setOf("ONCE", "KRX_REPEAT", "SYNC"), setOf("ONCE", "SYNC"),
+            setOf("ABS_ONCE", "SIGNED_REPEAT")
         ), JOURNEYS.map { it.copies.keys })
         for (journey in JOURNEYS) {
             val source = journey.source()
@@ -88,7 +89,7 @@ class E5dJourneyJ13GoldenDataTest {
                 assertEquals("$id: the golden's notification body is its data body", body, (data(id).getValue("body") as JsonPrimitive).content)
                 assertEquals("${journey.klass}.$name: body", body, copy(source, name, journey)!!.single { it.first == "body" }.second)
             }
-            assertEquals("${journey.klass}: deliver", emptyList<String>(), deliverProblems(source))
+            assertEquals("${journey.klass}: deliver", emptyList<String>(), deliverProblems(source, if (journey == J19) J19_DELIVER else DELIVER))
             assertEquals("${journey.klass}: the copies' uses", emptyList<String>(), useProblems(source, journey))
         }
     }
@@ -285,6 +286,65 @@ class E5dJourneyJ13GoldenDataTest {
         assertTrue("visible helper discards its input", !repeatBinding(changed(source, route, route.replace("(data,", "(ONCE,"))))
     }
 
+    @Test
+    fun comparisonGoldensBindNotificationAndEachInjection() {
+        val source = J19.source()
+        for ((name, id) in J19.copies) {
+            val payload = root(id)
+            val copied = copy(source, name, J19)!!
+            assertEquals(data(id).keys.toList(), copied.map { it.first })
+            for (field in listOf("title", "body")) {
+                assertEquals(data(id).getValue(field), payload.getValue("notification").jsonObject.getValue(field))
+            }
+        }
+        assertTrue(comparisonBinding(source))
+        val absolute = data(J19.copies.getValue("ABS_ONCE"))
+        val swapped = changed(source, "\"left_source\" to \"krx\"", "\"left_source\" to \"hana\"")
+        assertTrue(problems(copy(swapped, "ABS_ONCE", J19)!!, absolute).isNotEmpty())
+        val gap = """하나\u00A0\u00A0차이"""
+        assertTrue(problems(copy(changed(source, gap, "하나  차이"), "ABS_ONCE", J19)!!, absolute).isNotEmpty())
+        for ((old, new) in listOf(
+            """"left_source" to "kb"""" to """"right_source" to "kb"""",
+            "foreground(ABS_ONCE, false)" to "foreground(allowedAbsolute(ABS_ONCE), false)",
+            "tray(allowedAbsolute(ABS_ONCE), true, false)" to "tray(ABS_ONCE, true, false)",
+            "deliver(data, !sdk)" to "deliver(ABS_ONCE, !sdk)"
+        )) assertTrue(!comparisonBinding(changed(source, old, new)))
+        assertTrue(deliverProblems(changed(source, """putExtra("title", data.getValue("title"))""",
+            """putExtra("title", mid)"""), J19_DELIVER).isNotEmpty())
+    }
+
+    private fun comparisonBinding(source: String): Boolean {
+        val code = tokens(source) ?: return false
+        fun unique(fragment: String): Boolean {
+            val part = tokens(fragment)!!
+            return (0..code.size - part.size).count { code.subList(it, it + part.size) == part } == 1
+        }
+        // Include the beginning of the next member to close both expression-bodied derivatives.
+        return listOf(
+            """private fun allowedAbsolute(base: Map<String, String>) = base + mapOf("left_source" to "kb", "left_asset" to "usd-krw",
+                "title" to base.getValue("title").replace("달러선물", "국민")) private fun allowedSigned""",
+            """private fun allowedSigned(base: Map<String, String>) = base + mapOf("right_source" to "hana", "right_asset" to "usd-krw",
+                "title" to base.getValue("title").replace("달러선물", "하나")) private fun deliver""",
+            """fun J19_0_foregroundAllowed() {
+                sub(103, "absolute") { foreground(allowedAbsolute(ABS_ONCE), true) }
+                sub(106, "signed") { foreground(allowedSigned(SIGNED_REPEAT), true) } }""",
+            """fun J19_1_foregroundForbidden() {
+                sub(103, "absolute") { foreground(ABS_ONCE, false) }
+                sub(106, "signed") { foreground(SIGNED_REPEAT, false) } }""",
+            """fun J19_2_backgroundLauncher() {
+                var ordinary = emptyList<Int>()
+                sub(103, "control") { ordinary = launcher(allowedAbsolute(ABS_ONCE), false, emptyList()) }
+                sub(103, "sdk") { launcher(allowedAbsolute(ABS_ONCE), true, ordinary) } }""",
+            """fun J19_3_allowedTrayTaps() {
+                sub(103, "app") { tray(allowedAbsolute(ABS_ONCE), false, false) }
+                sub(103, "sdk") { tray(allowedAbsolute(ABS_ONCE), true, false) } }""",
+            """fun J19_4_forbiddenSdkTap() { sub(103, "sdk-forbidden") { tray(ABS_ONCE, true, true) } }""",
+            """premise("FCM") { deliver(data, true) }""",
+            """if (inject) premise("background FCM") { deliver(data, false) }""",
+            """premise("notification injection") { deliver(data, !sdk) }"""
+        ).all(::unique) && code.count { it == Token('w', "deliver") } == 4
+    }
+
     companion object {
         const val JOURNEY = "../e5dJourney/src/main/kotlin/com/jay/fxi/e5djourney/test/J13FcmDisplayTest.kt"
         const val SYNC_DECLARATION = "val SYNC = mapOf(\"type\" to \"sync_alerts\")"
@@ -304,7 +364,9 @@ class E5dJourneyJ13GoldenDataTest {
             mapOf("ONCE" to "fcm-source-alert-once", "KRX_REPEAT" to "fcm-source-alert-repeat-krx", "SYNC" to "fcm-sync-alerts"))
         val J17 = Journey("../e5dJourney/src/main/kotlin/com/jay/fxi/e5djourney/test/J17SourceFcmReturnAndTapTest.kt", "J17SourceFcmReturnAndTapTest",
             mapOf("ONCE" to "fcm-source-alert-once", "SYNC" to "fcm-sync-alerts"))
-        val JOURNEYS = listOf(J13, J14, J16, J17)
+        val J19 = Journey("../e5dJourney/src/main/kotlin/com/jay/fxi/e5djourney/test/J19ComparisonDeliveryJourneyTest.kt", "J19ComparisonDeliveryJourneyTest",
+            mapOf("ABS_ONCE" to "fcm-comparison-alert-absolute-once", "SIGNED_REPEAT" to "fcm-comparison-alert-signed-repeat"))
+        val JOURNEYS = listOf(J13, J14, J16, J17, J19)
 
         /** The journey class with a companion that declares just [declaration]. */
         fun inCompanion(declaration: String): String = "class $JOURNEY_CLASS {\n    private companion object {\n        $declaration\n    }\n}\n"
@@ -547,6 +609,20 @@ class E5dJourneyJ13GoldenDataTest {
             "}"
         ).joinToString("\n")
 
+        val J19_DELIVER = """private fun deliver(data: Map<String, String>, front: Boolean) {
+        mid = UUID.randomUUID().toString()
+        val ack = run.client.ack("fcm", nonce) {
+            putExtra("data", Bundle().apply { data.forEach { (key, value) -> putString(key, value) } })
+            putExtra("mid", mid)
+            putExtra("title", data.getValue("title"))
+            putExtra("body", data.getValue("body"))
+        }
+        log("fcm", ack, mid, true)
+        check(ack.getInt("result") == -1 && ack.getInt("pid") == pid && !ack.getBoolean("keyguard") &&
+            (ack.getInt("importanceBefore") == 100) == front)
+        check(texts(since(mark), "control").count { it == "fcm mid=${'$'}mid visible=true result=-1 failure=null" } == 1)
+    }"""
+
         /** A token of Kotlin source: a word (`w`), a punctuation character (`p`), or a quoted string (`s`), raw string (`r`) or character (`c`) literal. */
         data class Token(val kind: Char, val text: String)
 
@@ -603,9 +679,9 @@ class E5dJourneyJ13GoldenDataTest {
          * What makes the journey's `deliver` other than its reviewed form [DELIVER]: it must be declared once, privately, and
          * its tokens from `private` to the brace that closes its body must be the reviewed ones, one for one.
          */
-        fun deliverProblems(source: String): List<String> {
+        fun deliverProblems(source: String, form: String = DELIVER): List<String> {
             val tokens = tokens(source) ?: return listOf("the source does not lex")
-            val reviewed = tokens(DELIVER) ?: return listOf("the reviewed form does not lex")
+            val reviewed = tokens(form) ?: return listOf("the reviewed form does not lex")
             val name = listOf(Token('w', "fun"), Token('w', "deliver"), Token('p', "("))
             val declared = (1..tokens.size - name.size).filter { tokens.subList(it, it + name.size) == name }
             val start = declared.singleOrNull()?.minus(1)?.takeIf { tokens[it] == Token('w', "private") } ?: return listOf("deliver: not declared once, privately")

@@ -8,7 +8,24 @@ import android.content.Intent
 import android.database.Cursor
 import android.net.Uri
 import android.os.Bundle
+import androidx.core.util.Consumer
 import androidx.lifecycle.Lifecycle
+import android.os.Handler
+import android.os.Looper
+import com.jay.fxi.MainActivity
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.onSubscription
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
+import org.json.JSONObject
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
@@ -77,6 +94,110 @@ internal object E5dJourneyLifecycle : Application.ActivityLifecycleCallbacks {
         if (activity is com.jay.fxi.MainActivity) {
             val carried = carried(activity.intent, SOURCE_KEYS)
             E5dJourneyRecord.add("intent-source", "MainActivity#$activityId extras[$carried]")
+            if (busJob != null) {
+                install(activity)
+                creating[activity] = pre(activity, activity.intent, "create", savedInstanceState != null)
+            }
+        }
+    }
+
+    // All observer state is main-thread confined. A subscription spans Activity replacement.
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var busJob: Job? = null
+    private var subscription = 0
+    private var entrySerial = 0
+    private var enabled: Boolean? = null
+    private var busActivity = 0L
+    private val slots = IdentityHashMap<MainActivity, Job>()
+    private val listeners = IdentityHashMap<MainActivity, Consumer<Intent>>()
+    private class Entry(val activity: Long, val serial: Int, val intent: Intent, val kind: String, val saved: Boolean?)
+    private val creating = IdentityHashMap<MainActivity, Entry>()
+    private val main = Handler(Looper.getMainLooper())
+    private fun observer(event: String, activity: Long) {
+        E5dJourneyRecord.add("comparison-observer",
+            "event=$event activity=$activity subscription=$subscription pendingTapEnabled=${checkNotNull(enabled)}")
+    }
+
+    fun beginComparison() = runBlocking {
+        withContext(Dispatchers.Main) {
+            val activity = synchronized(ids) { ids.keys.filterIsInstance<MainActivity>().singleOrNull() }
+                ?: throw IllegalStateException("j19 observer: no single MainActivity")
+            val bus = activity.alertEventBusProvider.get()
+            enabled = bus.pendingTapEnabled
+            busActivity = id(activity)
+            subscription++
+            busJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+                bus.events.onSubscription { observer("bus-ready", busActivity) }.collect {
+                    E5dJourneyRecord.add("comparison-bus", "subscription=$subscription value=$it")
+                }
+            }
+            install(activity)
+            yield()
+        }
+    }
+
+    fun endComparison(): Boolean = runBlocking {
+        withContext(Dispatchers.Main) {
+            val job = busJob ?: return@withContext false
+            job.cancelAndJoin()
+            for (activity in listeners.keys.toList()) uninstall(activity)
+            observer("bus-end", busActivity)
+            busJob = null
+            true
+        }
+    }
+
+    private fun install(activity: MainActivity) {
+        if (listeners.containsKey(activity)) return
+        val activityId = id(activity)
+        slots[activity] = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            var initial = true
+            activity.pendingAlertEvent.collect {
+                E5dJourneyRecord.add("comparison-slot", "activity=$activityId subscription=$subscription value=$it")
+                if (initial) {
+                    initial = false
+                    observer("slot-ready", activityId)
+                }
+            }
+        }
+        val listener = Consumer<Intent> { incoming ->
+            val entry = pre(activity, incoming, "warm", null)
+            main.post { recordEntry(entry, "post") }
+        }
+        listeners[activity] = listener
+        activity.addOnNewIntentListener(listener)
+        observer("listener-ready", activityId)
+    }
+
+    private fun uninstall(activity: MainActivity) {
+        listeners.remove(activity)?.let(activity::removeOnNewIntentListener)
+        slots.remove(activity)?.cancel()
+        creating.remove(activity)
+    }
+
+    private fun pre(activity: MainActivity, intent: Intent, kind: String, saved: Boolean?) =
+        Entry(id(activity), ++entrySerial, intent, kind, saved).also { recordEntry(it, "pre") }
+
+    @Suppress("DEPRECATION")
+    private fun recordEntry(entry: Entry, edge: String) {
+        val extras = entry.intent.extras
+        val fields = JSONObject()
+        for (key in keys) {
+            val value = extras?.get(key)
+            fields.put(key, JSONObject().put("present", extras?.containsKey(key) == true)
+                .put("class", value?.javaClass?.name ?: JSONObject.NULL).put("value", value ?: JSONObject.NULL))
+        }
+        E5dJourneyRecord.add("intent-comparison", JSONObject().put("nonce", E5dJourneyRecord.nonce)
+            .put("pid", E5dJourneyRecord.pid).put("activity", entry.activity).put("serial", entry.serial)
+            .put("entry", entry.kind).put("saved", entry.saved ?: JSONObject.NULL).put("edge", edge)
+            .put("ref", System.identityHashCode(entry.intent)).put("flags", entry.intent.flags).put("extras", fields).toString())
+    }
+
+    override fun onActivityPostCreated(activity: Activity, savedInstanceState: Bundle?) {
+        if (activity is MainActivity) creating.remove(activity)?.let {
+            recordEntry(it, "post")
+            E5dJourneyRecord.add("comparison-slot-sample",
+                "activity=${it.activity} subscription=$subscription value=${activity.pendingAlertEvent.value}")
         }
     }
 
@@ -98,6 +219,8 @@ internal object E5dJourneyLifecycle : Application.ActivityLifecycleCallbacks {
 
     private val SOURCE_KEYS = listOf("source", "asset")
     private val TAP_KEYS = listOf("notification_type", "type", "setting_id", "is_repeat")
+    private val keys = TAP_KEYS + listOf("tab", "diff_type", "left_source", "left_asset", "right_source", "right_asset",
+        "source", "asset", "title", "body", "left_rate", "right_rate", "left_observed_at", "right_observed_at", "threshold", "operator", "spread")
 
     override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = note(activity, "created")
     override fun onActivityStarted(activity: Activity) = note(activity, "started")
@@ -105,5 +228,9 @@ internal object E5dJourneyLifecycle : Application.ActivityLifecycleCallbacks {
     override fun onActivityPaused(activity: Activity) = note(activity, "paused")
     override fun onActivityStopped(activity: Activity) = note(activity, "stopped")
     override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = note(activity, "saved-state")
-    override fun onActivityDestroyed(activity: Activity) = note(activity, "destroyed")
+    override fun onActivityDestroyed(activity: Activity) {
+        note(activity, "destroyed")
+        if (activity is MainActivity) uninstall(activity)
+        synchronized(ids) { ids.remove(activity) }
+    }
 }

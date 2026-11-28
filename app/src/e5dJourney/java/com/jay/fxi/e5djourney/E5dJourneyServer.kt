@@ -1,10 +1,15 @@
 package com.jay.fxi.e5djourney
 
+import android.util.JsonReader
+import android.util.JsonToken
 import com.jay.fxi.BuildConfig
 import com.jay.fxi.data.free.FreeSnapshotSchedulePolicy
 import com.jay.fxi.data.remote.dto.EntitlementsResponse
 import com.jay.fxi.di.ServerEndpoints
 import java.net.InetAddress
+import java.security.MessageDigest
+import java.util.UUID
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -86,6 +91,8 @@ internal class E5dJourneyServer(private val load: (String) -> ByteArray) : AutoC
     private var nextAlertId = 1001
     private val sourceRows = mutableListOf<JsonObject>()
     private var nextSourceId = 2001
+    private val comparisonRows = mutableListOf<JsonObject>()
+    private var nextComparisonId = 3001
     private val connections = AtomicInteger()
 
     /** The REST and WebSocket base of this process's server, once it is bound. */
@@ -170,6 +177,89 @@ internal class E5dJourneyServer(private val load: (String) -> ByteArray) : AutoC
         true
     }
 
+    private class Gate(val ticket: String) {
+        val latch = CountDownLatch(1)
+        var arrived = false
+    }
+
+    private var gate: Gate? = null
+    private val issuedTickets = mutableSetOf<String>()
+
+    private fun canonical(value: JsonElement): JsonElement = when (value) {
+        is JsonObject -> JsonObject(value.toSortedMap().mapValues { canonical(it.value) })
+        is JsonArray -> JsonArray(value.map(::canonical))
+        is JsonPrimitive -> value
+    }
+
+    private fun snapshot(): Map<String, Any> {
+        val bytes = canonical(JsonArray(comparisonRows)).toString().encodeToByteArray()
+        val hash = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+        return mapOf("rowsHash" to hash, "nextComparisonId" to nextComparisonId,
+            "tickets" to listOfNotNull(gate?.let { mapOf("ticket" to it.ticket, "state" to if (it.arrived) "arrived" else "held") }))
+    }
+
+    fun comparisonCommand(command: String, request: String?, fields: Map<String, Any?>): Pair<Boolean, Map<String, Any?>> =
+        E5dJourneyRecord.under {
+            val before = snapshot()
+            val common = setOf("request", "nonce", "arg")
+            val arg = fields["arg"] as? String
+            val current = gate
+            val ack: Map<String, Any>? = when {
+                request.isNullOrBlank() -> null
+                command == "comparison-row" -> {
+                    val id = when (fields["id"]) {
+                        "103" -> 103
+                        "106" -> 106
+                        else -> null
+                    }
+                    if (fields.keys == common + "id" && id != null && changeRow(id, arg))
+                        mapOf("id" to id, "state" to checkNotNull(arg)) else null
+                }
+                arg == "hold" && fields.keys == common && current == null &&
+                    comparisonRows.singleOrNull()?.get("id") in listOf(JsonPrimitive(103), JsonPrimitive(106)) &&
+                    runCatching { UUID.fromString(request).toString() == request }.getOrDefault(false) && issuedTickets.add(request) -> {
+                    gate = Gate(request)
+                    E5dJourneyRecord.add("comparison-gate", "hold ticket=$request")
+                    mapOf("ticket" to request)
+                }
+                arg == "release" && fields.keys == common + "ticket" && current != null && fields["ticket"] == current.ticket -> {
+                    gate = null
+                    E5dJourneyRecord.add("comparison-gate", "release ticket=${current.ticket}")
+                    current.latch.countDown()
+                    mapOf("ticket" to current.ticket)
+                }
+                else -> null
+            }
+            val body = ack?.plus("recordUpper" to E5dJourneyRecord.upper()) ?: mapOf("reason" to command)
+            (ack != null) to body.plus("detail" to mapOf("before" to before, "after" to snapshot()))
+        }
+
+    private fun changeRow(id: Int, state: String?): Boolean {
+        val once = id == 103
+        val identity = mapOf("id" to JsonPrimitive(id), "user_id" to JsonPrimitive(E5dJourneyIdentity.UID),
+            "tab" to JsonPrimitive(if (once) "usd" else "tether"), "diff_type" to JsonPrimitive(if (once) "absolute" else "signed"),
+            "left_source" to JsonPrimitive(if (once) "kb" else "upbit"), "left_asset" to JsonPrimitive(if (once) "usd-krw" else "usdt-krw"),
+            "right_source" to JsonPrimitive("hana"), "right_asset" to JsonPrimitive("usd-krw"))
+        when (state) {
+            "seed" -> {
+                if (comparisonRows.isNotEmpty()) return false
+                val base = Json.parseToJsonElement(load("comparison-setting-response.json").decodeToString()).jsonObject
+                comparisonRows += JsonObject(base + identity + mapOf("operator" to JsonPrimitive(if (once) "gte" else "lte"),
+                    "threshold" to JsonPrimitive(if (once) 8 else -5), "repeat_interval_sec" to if (once) JsonNull else JsonPrimitive(300),
+                    "is_enabled" to JsonPrimitive(true), "triggered" to JsonPrimitive(false)))
+            }
+            "armed", "fired" -> {
+                val row = comparisonRows.singleOrNull() ?: return false
+                if (!identity.all { (key, value) -> row[key] == value }) return false
+                comparisonRows[0] = JsonObject(row + mapOf("is_enabled" to JsonPrimitive(state == "armed"),
+                    "triggered" to JsonPrimitive(state == "fired")))
+            }
+            else -> return false
+        }
+        E5dJourneyRecord.add("server", "comparison row id=$id -> $state n=${comparisonRows.size}")
+        return true
+    }
+
     override fun close() {
         server.shutdown()
     }
@@ -205,10 +295,103 @@ internal class E5dJourneyServer(private val load: (String) -> ByteArray) : AutoC
                     response to "$method $path q=$queryText -> $kind"
                 }
             }
+            if (path.startsWith("/api/comparison")) {
+                val bytes = request.body.readByteArray()
+                val body = runCatching { bytes.decodeToString(throwOnInvalidSequence = true) }.getOrNull()
+                val (reply, held) = E5dJourneyRecord.under {
+                    val (kind, response) = when {
+                        path == COMPARISON_SETTINGS && url?.encodedQuery == null && method == "POST" &&
+                            body != null && request.bodySize > 0L && request.bodySize == bytes.size.toLong() ->
+                            comparisonCreate(body)
+                        path == COMPARISON_SETTINGS && url?.encodedQuery == null && method == "GET" && request.bodySize == 0L ->
+                            comparisonList()
+                        path == COMPARISON_HISTORY && method == "GET" && request.bodySize == 0L && query == HISTORY_QUERY ->
+                            comparisonHistory()
+                        else -> unexpected()
+                    }
+                    E5dJourneyRecord.add("http", "$method $path q=$queryText -> $kind")
+                    val detail = JsonObject(mapOf(
+                        "httpSeq" to JsonPrimitive(E5dJourneyRecord.upper()), "method" to JsonPrimitive(method),
+                        "path" to JsonPrimitive(path), "encodedQuery" to JsonPrimitive(url?.encodedQuery),
+                        "query" to JsonObject(query.mapValues { (_, values) -> JsonArray(values.map { JsonPrimitive(it) }) }),
+                        "bodySize" to JsonPrimitive(request.bodySize), "body" to JsonPrimitive(body),
+                        "status" to JsonPrimitive(response.status.split(' ')[1].toInt())
+                    ))
+                    E5dJourneyRecord.add("comparison-http", detail.toString())
+                    val held = gate?.takeIf { !it.arrived && kind.startsWith("comparison alerts list ") }
+                    held?.let {
+                        it.arrived = true
+                        E5dJourneyRecord.add("comparison-gate", "arrive ticket=${it.ticket}")
+                    }
+                    response to held
+                }
+                if (held != null && !held.latch.await(8, TimeUnit.SECONDS)) E5dJourneyRecord.under {
+                    if (gate === held) gate = null
+                    E5dJourneyRecord.add("comparison-gate", "expired ticket=${held.ticket}")
+                }
+                return reply
+            }
             val (kind, response) = route(method, path, query, request)
             E5dJourneyRecord.add("http", "$method $path q=$queryText -> $kind")
             return response
         }
+    }
+
+    private fun envelope(key: String, rows: List<JsonObject>) =
+        JsonObject(mapOf(key to JsonArray(rows), "total_count" to JsonPrimitive(rows.size))).toString()
+
+    private fun comparisonList(): Pair<String, MockResponse> {
+        val body = envelope("alerts", comparisonRows)
+        val suffix = if (comparisonRows.isEmpty()) "" else " body=$body"
+        return "comparison alerts list n=${comparisonRows.size}$suffix" to ok(body.encodeToByteArray())
+    }
+
+    private fun comparisonCreate(body: String): Pair<String, MockResponse> {
+        // Read decoded names before a JSON map can collapse repeated members.
+        val unique = runCatching {
+            JsonReader(body.reader()).use { reader ->
+                val names = mutableSetOf<String>()
+                reader.beginObject()
+                while (reader.hasNext()) {
+                    if (!names.add(reader.nextName())) return@use false
+                    reader.skipValue()
+                }
+                reader.endObject()
+                reader.peek() == JsonToken.END_DOCUMENT
+            }
+        }.getOrDefault(false)
+        if (!unique) return unexpected()
+        val asked = runCatching { Json.parseToJsonElement(body).jsonObject }.getOrNull() ?: return unexpected()
+        val threshold = asked["threshold"] as? JsonPrimitive ?: return unexpected()
+        if (asked.keys != COMPARISON_FIELDS.keys + "threshold" || !COMPARISON_FIELDS.all { (k, v) -> asked[k] == v } ||
+            threshold.isString || !JSON_NUMBER.matches(threshold.content) ||
+            threshold.content.toBigDecimalOrNull()?.compareTo((-5).toBigDecimal()) != 0) return unexpected()
+
+        val template = Json.parseToJsonElement(load("comparison-setting-response.json").decodeToString()).jsonObject
+        val id = nextComparisonId++
+        val returned = JsonObject(template + asked + mapOf("id" to JsonPrimitive(id),
+            "user_id" to JsonPrimitive(E5dJourneyIdentity.UID), "triggered" to JsonPrimitive(false),
+            "last_notified_spread" to JsonNull)).toString().encodeToByteArray()
+        val returnedRow = Json.parseToJsonElement(returned.decodeToString()).jsonObject
+        comparisonRows += JsonObject(returnedRow + ("threshold" to JsonPrimitive(-7)))
+        val evidence = JsonObject(mapOf("asked" to asked, "returned" to returnedRow, "stored" to comparisonRows.last()))
+        return "comparison create id=$id n=${comparisonRows.size} evidence=$evidence" to ok(returned)
+    }
+
+    private fun comparisonHistory(): Pair<String, MockResponse> {
+        val setting = comparisonRows.lastOrNull { (it["id"]?.jsonPrimitive?.intOrNull ?: 0) >= 3001 }
+        val logs = if (setting == null) emptyList() else {
+            val observed = JsonPrimitive("2026-08-31T09:59:00+09:00")
+            val template = Json.parseToJsonElement(load("comparison-history-item.json").decodeToString()).jsonObject
+            val pair = setting.filterKeys { it in HISTORY_PAIR_KEYS }
+            listOf(JsonObject(template + pair + mapOf(
+                "setting_id" to setting.getValue("id"), "threshold" to JsonPrimitive(-4),
+                "left_rate" to JsonPrimitive(1380), "right_rate" to JsonPrimitive(1400), "spread" to JsonPrimitive(-20),
+                "is_repeat" to JsonPrimitive(true), "left_observed_at" to observed, "right_observed_at" to observed
+            )))
+        }
+        val body = envelope("logs", logs)
+        return "comparison history body=$body" to ok(body.encodeToByteArray())
     }
 
     private fun route(method: String, path: String, query: Map<String, List<String?>>, request: RecordedRequest): Pair<String, MockResponse> {
@@ -227,10 +410,6 @@ internal class E5dJourneyServer(private val load: (String) -> ByteArray) : AutoC
                 val file = topic?.let { TOPIC_FILES[it] }
                 if (query.keys != setOf("topic") || file == null) return unexpected()
                 "topic-snapshot $topic" to ok(load(file))
-            }
-            "/api/comparison-alerts" -> {
-                if (request.requestUrl?.encodedQuery != null) return unexpected()
-                "comparison alerts list n=0" to ok("""{"alerts":[],"total_count":0}""".encodeToByteArray())
             }
             SOURCE_HISTORY -> {
                 if (query != mapOf("asset" to listOf(SOURCE_ASSET), "limit" to listOf("100")) || request.bodySize != 0L) return unexpected()
@@ -512,9 +691,19 @@ internal class E5dJourneyServer(private val load: (String) -> ByteArray) : AutoC
     private companion object {
         const val ENTITLEMENTS = "/api/entitlements"
         const val ALERT_SETTINGS = "/api/notification-settings"
+        const val SOURCE_ASSET = "usdt-krw"
+        const val COMPARISON_SETTINGS = "/api/comparison-alerts"
+        const val COMPARISON_HISTORY = "/api/comparison-notification-logs"
+        val HISTORY_QUERY = mapOf("tab" to listOf("tether"), "diff_type" to listOf("signed"), "limit" to listOf("100"))
+        val COMPARISON_FIELDS = mapOf(
+            "tab" to JsonPrimitive("tether"), "diff_type" to JsonPrimitive("signed"),
+            "left_source" to JsonPrimitive("upbit"), "left_asset" to JsonPrimitive(SOURCE_ASSET),
+            "right_source" to JsonPrimitive("hana"), "right_asset" to JsonPrimitive("usd-krw"),
+            "operator" to JsonPrimitive("lte"), "repeat_interval_sec" to JsonPrimitive(300), "is_enabled" to JsonPrimitive(true)
+        )
+        val HISTORY_PAIR_KEYS = COMPARISON_FIELDS.keys - setOf("repeat_interval_sec", "is_enabled")
         const val SOURCE_SETTINGS = "/api/source-notification-settings"
         const val SOURCE_HISTORY = "/api/source-notification-logs"
-        const val SOURCE_ASSET = "usdt-krw"
         const val SOURCE_ROW = "source-setting-response.json"
         const val SOURCE_HISTORY_LIST = "source-history-list.json"
         val SOURCE_CREATE_KEYS = setOf("source", "asset", "condition", "threshold", "is_enabled")

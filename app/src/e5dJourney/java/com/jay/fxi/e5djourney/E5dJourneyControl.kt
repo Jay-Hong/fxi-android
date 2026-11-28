@@ -14,6 +14,7 @@ import android.net.Uri
 import android.os.Bundle
 import com.google.android.gms.tasks.Tasks
 import com.google.firebase.messaging.FcmBroadcastProcessor
+import com.jay.fxi.ui.alert.ComparisonAlertSectionEntryPoint
 import dagger.hilt.android.EntryPointAccessors
 import java.util.concurrent.Executors
 import kotlinx.coroutines.runBlocking
@@ -87,6 +88,8 @@ internal object E5dJourneyControl {
             PHASE -> {
                 val name = extras.getString(EXTRA_ARG).orEmpty()
                 if (name.isEmpty()) return answer(REJECT, mapOf("reason" to "phase"))
+                if (name == "j19-observer-end" && !E5dJourneyLifecycle.endComparison())
+                    return answer(REJECT, mapOf("reason" to "phase"))
                 val sequence = E5dJourneyRecord.mark(name)
                 if (sequence < 0) return answer(REJECT, mapOf("reason" to "overflowed"))
                 answer(ACK, mapOf("phase" to name, "sequence" to sequence))
@@ -132,6 +135,17 @@ internal object E5dJourneyControl {
                 // while it was taken, so a journey can tell which answer a decision can have come from.
                 val before = E5dJourneyRecord.upper()
                 val reading = E5dJourneyAccess.read(entry.premiumAccessCoordinator())
+                if (extras.getString(EXTRA_ARG) == "sample-row-103" &&
+                    E5dJourneyRecord.currentPhase() == "J19_3-2-manual-absolute-true") {
+                    val graph = EntryPointAccessors.fromApplication(context.applicationContext, ComparisonAlertSectionEntryPoint::class.java)
+                    val owner = graph.comparisonAlertSettingsOwner()
+                    E5dJourneyRecord.addWith("comparison-owner") {
+                        val state = owner.state.value
+                        val row = state.adopted?.rows?.singleOrNull { it.id == 103 }
+                        Unit to "id=103 uid=${state.identity?.uid} generation=${state.identity?.authGeneration} " +
+                            "isEnabled=${row?.isEnabled} triggered=${row?.triggered}"
+                    }
+                }
                 answer(ACK, reading + mapOf("recordUpperBefore" to before, "recordUpperAfter" to E5dJourneyRecord.upper()))
             }
             SIGN_IN -> { entry.identity().signIn(); answer(ACK, mapOf("signedIn" to entry.identity().isSignedIn())) }
@@ -175,7 +189,9 @@ internal object E5dJourneyControl {
             NOTIFICATIONS -> {
                 val active = context.getSystemService(NotificationManager::class.java).activeNotifications.map {
                     mapOf("tag" to it.tag, "id" to it.id, "channel" to it.notification.channelId,
-                        "title" to it.notification.extras.getCharSequence(Notification.EXTRA_TITLE)?.toString(), "postTime" to it.postTime)
+                        "title" to it.notification.extras.getCharSequence(Notification.EXTRA_TITLE)?.toString(), "postTime" to it.postTime) +
+                        if (extras.getBoolean("comparisonDetail")) mapOf("key" to it.key, "packageName" to it.packageName,
+                            "text" to it.notification.extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()) else emptyMap()
                 }
                 answer(ACK, mapOf("active" to active, "now" to System.currentTimeMillis()))
             }
@@ -202,6 +218,13 @@ internal object E5dJourneyControl {
                 if (id != "102" || state == null || state !in setOf("seed", "armed", "fired") ||
                     !entry.server().sourceRow(102, state)) return answer(REJECT, mapOf("reason" to SOURCE_ROW))
                 answer(ACK, mapOf("id" to 102, "state" to state, "recordUpper" to E5dJourneyRecord.upper()))
+            }
+            COMPARISON_ROW, COMPARISON_READ -> {
+                @Suppress("DEPRECATION")
+                val fields = extras.keySet().associateWith { extras.get(it) }
+                val (accepted, body) = entry.server().comparisonCommand(command, fields[EXTRA_REQUEST] as? String, fields)
+                if (accepted && command == COMPARISON_ROW && body["state"] == "seed") E5dJourneyLifecycle.beginComparison()
+                answer(if (accepted) ACK else REJECT, body)
             }
             else -> answer(REJECT, mapOf("reason" to "command"))
         }
@@ -298,11 +321,13 @@ internal object E5dJourneyControl {
     const val NOTIFICATIONS_CLEAR = "notifications-clear"
     const val ALERT_ROW = "alert-row"
     const val SOURCE_ROW = "source-row"
+    const val COMPARISON_ROW = "comparison-row"
+    const val COMPARISON_READ = "comparison-read"
     const val EXTRA_ID = "id"
 
     private const val FCM_RECEIVE = "com.google.android.c2dm.intent.RECEIVE"
     private const val FCM_SENDER = "000000000000"
     private val FCM_RESERVED_PREFIXES = listOf("google.", "gcm.")
     private val FCM_ENVELOPE_KEYS = setOf("from", "message_type", "collapse_key")
-    private val NEEDS_READY = setOf(START, PHASE, ANSWER, SIGN_OUT, SIGN_IN, ARM, RELEASE, LOCAL_PREMIUM, ACCESS, SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR, ALERT_ROW, SOURCE_ROW)
+    private val NEEDS_READY = setOf(START, PHASE, ANSWER, SIGN_OUT, SIGN_IN, ARM, RELEASE, LOCAL_PREMIUM, ACCESS, SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR, ALERT_ROW, SOURCE_ROW, COMPARISON_ROW, COMPARISON_READ)
 }

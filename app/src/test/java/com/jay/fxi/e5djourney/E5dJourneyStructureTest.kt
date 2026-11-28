@@ -376,15 +376,17 @@ class E5dJourneyStructureTest {
         val ready = READY_LINES[1]
         assertTrue(source.count(READY_LINES[2]) == 1)
         for ((what, broken) in listOf(
-            "local-premium not waiting" to source.replace("RELEASE, LOCAL_PREMIUM, ACCESS, SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR, ALERT_ROW, SOURCE_ROW)", "RELEASE, ACCESS, SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR, ALERT_ROW, SOURCE_ROW)"),
-            "access not waiting" to source.replace("RELEASE, LOCAL_PREMIUM, ACCESS, SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR, ALERT_ROW, SOURCE_ROW)", "RELEASE, LOCAL_PREMIUM, SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR, ALERT_ROW, SOURCE_ROW)"),
-            "seed-last-bank not waiting" to source.replace("RELEASE, LOCAL_PREMIUM, ACCESS, SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR, ALERT_ROW, SOURCE_ROW)", "RELEASE, LOCAL_PREMIUM, ACCESS, FCM, NOTIFICATIONS_CLEAR, ALERT_ROW, SOURCE_ROW)"),
+            "local-premium not waiting" to source.replace("RELEASE, LOCAL_PREMIUM, ACCESS, SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR, ALERT_ROW, SOURCE_ROW, COMPARISON_ROW, COMPARISON_READ)", "RELEASE, ACCESS, SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR, ALERT_ROW, SOURCE_ROW, COMPARISON_ROW, COMPARISON_READ)"),
+            "access not waiting" to source.replace("RELEASE, LOCAL_PREMIUM, ACCESS, SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR, ALERT_ROW, SOURCE_ROW, COMPARISON_ROW, COMPARISON_READ)", "RELEASE, LOCAL_PREMIUM, SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR, ALERT_ROW, SOURCE_ROW, COMPARISON_ROW, COMPARISON_READ)"),
+            "seed-last-bank not waiting" to source.replace("RELEASE, LOCAL_PREMIUM, ACCESS, SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR, ALERT_ROW, SOURCE_ROW, COMPARISON_ROW, COMPARISON_READ)", "RELEASE, LOCAL_PREMIUM, ACCESS, FCM, NOTIFICATIONS_CLEAR, ALERT_ROW, SOURCE_ROW, COMPARISON_ROW, COMPARISON_READ)"),
             // U3a: a synthetic delivery and the clearing of notifications change the app's state, so they wait as well.
-            "fcm not waiting" to source.replace("SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR, ALERT_ROW, SOURCE_ROW)", "SEED_LAST_BANK, NOTIFICATIONS_CLEAR, ALERT_ROW, SOURCE_ROW)"),
-            "notifications-clear not waiting" to source.replace("SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR, ALERT_ROW, SOURCE_ROW)", "SEED_LAST_BANK, FCM, ALERT_ROW, SOURCE_ROW)"),
+            "fcm not waiting" to source.replace("SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR, ALERT_ROW, SOURCE_ROW, COMPARISON_ROW, COMPARISON_READ)", "SEED_LAST_BANK, NOTIFICATIONS_CLEAR, ALERT_ROW, SOURCE_ROW, COMPARISON_ROW, COMPARISON_READ)"),
+            "notifications-clear not waiting" to source.replace("SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR, ALERT_ROW, SOURCE_ROW, COMPARISON_ROW, COMPARISON_READ)", "SEED_LAST_BANK, FCM, ALERT_ROW, SOURCE_ROW, COMPARISON_ROW, COMPARISON_READ)"),
             // U3a-2: the loopback server's row is the fixture's state behind the graph, so its command waits as well.
-            "alert-row not waiting" to source.replace("FCM, NOTIFICATIONS_CLEAR, ALERT_ROW, SOURCE_ROW)", "FCM, NOTIFICATIONS_CLEAR, SOURCE_ROW)"),
-            "source-row not waiting" to source.replace("ALERT_ROW, SOURCE_ROW)", "ALERT_ROW)"),
+            "alert-row not waiting" to source.replace("FCM, NOTIFICATIONS_CLEAR, ALERT_ROW, SOURCE_ROW, COMPARISON_ROW, COMPARISON_READ)", "FCM, NOTIFICATIONS_CLEAR, SOURCE_ROW, COMPARISON_ROW, COMPARISON_READ)"),
+            "source-row not waiting" to source.replace("ALERT_ROW, SOURCE_ROW, COMPARISON_ROW, COMPARISON_READ)", "ALERT_ROW, COMPARISON_ROW, COMPARISON_READ)"),
+            "comparison-row not waiting" to source.replace("SOURCE_ROW, COMPARISON_ROW, COMPARISON_READ)", "SOURCE_ROW, COMPARISON_READ)"),
+            "comparison-read not waiting" to source.replace("SOURCE_ROW, COMPARISON_ROW, COMPARISON_READ)", "SOURCE_ROW, COMPARISON_ROW)"),
             "readiness checked after the graph" to source.replace("$ready\n", "").replace(READY_LINES[2], READY_LINES[2] + "\n        $ready"),
             "readiness removed" to source.replace("$ready\n", "")
         )) {
@@ -770,7 +772,7 @@ class E5dJourneyStructureTest {
             "val entry by lazy { EntryPointAccessors.fromApplication(context.applicationContext, E5dJourneyEntryPoint::class.java) }"
         )
         const val NEEDS_READY_LINE =
-            "private val NEEDS_READY = setOf(START, PHASE, ANSWER, SIGN_OUT, SIGN_IN, ARM, RELEASE, LOCAL_PREMIUM, ACCESS, SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR, ALERT_ROW, SOURCE_ROW)"
+            "private val NEEDS_READY = setOf(START, PHASE, ANSWER, SIGN_OUT, SIGN_IN, ARM, RELEASE, LOCAL_PREMIUM, ACCESS, SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR, ALERT_ROW, SOURCE_ROW, COMPARISON_ROW, COMPARISON_READ)"
 
         fun readinessProblems(source: String): List<String> {
             val lines = source.lines().map(String::trim)

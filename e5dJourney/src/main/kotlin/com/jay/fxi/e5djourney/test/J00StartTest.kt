@@ -61,6 +61,8 @@ class J00StartTest {
     }
 
     private fun journey(nonce: String) {
+        // The free header can appear before tab restoration. The USD page heading follows hook selection.
+        waitText("달러 · USD/KRW", timeoutMillis = COLD_START_MILLIS)
         val start = client.ack("start", nonce)
         for ((key, want) in listOf(
             "buildType" to "e5dJourney",
