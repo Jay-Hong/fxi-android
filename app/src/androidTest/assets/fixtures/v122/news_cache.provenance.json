@@ -1,0 +1,99 @@
+{
+  "source": {
+    "commit": "6cea63951f1f9abf204997f86cb6fbe34c113c67",
+    "versionName": "1.2.2",
+    "versionCode": 15,
+    "basis": "C0 source reproduction (R4c/capture/manifest.json)",
+    "blobs": {
+      "NewsItem.kt": "3025fc51e3cd2086bcdf4388a4af276bf3fae0f7",
+      "NetworkModule.kt": "c29bf107af6044fd54a142fcf88f8bfa8458aeb1",
+      "InstantSerializer.kt": "95e238cebc6f05bdf93260bd632255e8dfff2082",
+      "CacheService.kt": "dbb528cc6fcab176025b3d508c8f55a0c2be387c"
+    }
+  },
+  "toolchain": {
+    "kotlin": "2.0.21",
+    "serializationPlugin": "2.0.21",
+    "kotlinx-serialization-json": "1.7.3",
+    "kotlinx-datetime": "0.6.1"
+  },
+  "generator": {
+    "className": "com.jay.fxi.S102LegacyNewsCacheWriter",
+    "legacySourcePath": "app/src/test/java/com/jay/fxi/S102LegacyNewsCacheWriter.kt",
+    "archivedSource": "R4c/S10/s10_2/gen_source.S102LegacyNewsCacheWriter.kt.txt",
+    "sha256": "ab001643be3fb5ac22ea5812cf0217cb659663d4eb68968fdf1b9850f0177d8a",
+    "task": ":app:testDebugUnitTest",
+    "command": "./gradlew --no-daemon :app:testDebugUnitTest --tests com.jay.fxi.S102LegacyNewsCacheWriter --rerun"
+  },
+  "configuration": {
+    "provider": "NetworkModule.provideJson()",
+    "ignoreUnknownKeys": true,
+    "coerceInputValues": true,
+    "isLenient": true,
+    "explicitNulls": true,
+    "encodeDefaults": false
+  },
+  "inputs": [
+    {
+      "id": "n1",
+      "title": "환율 📰 \"서울\" \\ 경로\n둘째 줄",
+      "link": null,
+      "source": "합성통신",
+      "content_type": "external_link",
+      "published_at": "2025-01-02T03:04:06.123Z"
+    },
+    {
+      "id": "n2",
+      "title": "n2",
+      "link": "https://fx.kbstar.com/a",
+      "source": "합성통신",
+      "content_type": "external_link",
+      "published_at": "2025-01-02T03:04:05.123Z"
+    },
+    {
+      "id": "n3",
+      "title": "n3",
+      "link": "https://Fx.KbStar.CoM/b",
+      "source": "합성통신",
+      "content_type": "external_link",
+      "published_at": "2025-01-02T03:04:04.123Z"
+    },
+    {
+      "id": "n4",
+      "title": "n4",
+      "link": "https://rreport.einfomax.co.kr/a.pdf",
+      "source": "합성통신",
+      "content_type": "report_pdf",
+      "published_at": "2025-01-02T03:04:03.123Z"
+    },
+    {
+      "id": "n5",
+      "title": "n5",
+      "link": "https://RReport.EInfoMax.Co.Kr/b.pdf",
+      "source": "합성통신",
+      "content_type": "report_pdf",
+      "published_at": "2025-01-02T03:04:02.123Z"
+    },
+    {
+      "id": "n6",
+      "title": "n6",
+      "link": "https://example.org/fx.kbstar.com?q=rreport.einfomax.co.kr",
+      "source": "합성통신",
+      "content_type": "future_kind",
+      "published_at": "2025-01-02T03:04:01.123Z"
+    }
+  ],
+  "freeVisibleIds": [
+    "n1",
+    "n6"
+  ],
+  "output": {
+    "name": "news_cache.json",
+    "bytes": 993,
+    "sha256": "8d41534c682d52f76e38c2c943f224f201c3521212851d264aedf0129d87e39b",
+    "matchingRuns": [
+      "gen_r1/news_cache.json",
+      "gen_r2/news_cache.json"
+    ]
+  }
+}
