@@ -51,8 +51,8 @@ data class NewsItem(
     val isPremiumContent: Boolean
         get() {
             val url = link ?: return false
-            val host = try { Uri.parse(url).host } catch (_: Exception) { null } ?: return false
-            return host in PREMIUM_HOSTS
+            val host = try { Uri.parse(url).host } catch (_: Exception) { null }
+            return isPremiumNewsHost(host)
         }
 
     /**
@@ -78,13 +78,16 @@ data class NewsItem(
             }
         }
     }
+}
 
-    companion object {
-        private val PREMIUM_HOSTS = setOf(
-            "fx.kbstar.com",
-            "rreport.einfomax.co.kr"
-        )
+internal fun isPremiumNewsHost(host: String?): Boolean {
+    if (host.isNullOrEmpty()) return false
+    val foldedHost = buildString(host.length) {
+        for (char in host) {
+            append(if (char in 'A'..'Z') char.lowercaseChar() else char)
+        }
     }
+    return foldedHost == "fx.kbstar.com" || foldedHost == "rreport.einfomax.co.kr"
 }
 
 @Serializable

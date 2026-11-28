@@ -53,6 +53,29 @@ import kotlinx.coroutines.launch
 
 private const val NEAR_TOP_OFFSET_DP = 120
 
+internal sealed interface NewsListState {
+    data object Loading : NewsListState
+    data class Error(val message: String) : NewsListState
+    data object Empty : NewsListState
+    data class Content(
+        val visibleItems: List<NewsItem>,
+        val showSubscriptionBanner: Boolean
+    ) : NewsListState
+}
+
+internal fun resolveNewsListState(
+    newsItems: List<NewsItem>,
+    visibleItems: List<NewsItem>,
+    isLoading: Boolean,
+    error: String?,
+    isPremium: Boolean
+): NewsListState = when {
+    newsItems.isNotEmpty() -> NewsListState.Content(visibleItems, showSubscriptionBanner = !isPremium)
+    isLoading -> NewsListState.Loading
+    error != null -> NewsListState.Error(error)
+    else -> NewsListState.Empty
+}
+
 /**
  * 뉴스 탭 콘텐츠
  *
@@ -79,6 +102,7 @@ fun NewsTabContent(
 
     val visibleItems = if (isPremium) newsItems
     else newsItems.filter { !it.isPremiumContent }
+    val contentState = resolveNewsListState(newsItems, visibleItems, isLoading, error, isPremium)
 
     val latestItemId = visibleItems.firstOrNull()?.id
     var previousItemId by remember { mutableStateOf<String?>(null) }
@@ -131,8 +155,8 @@ fun NewsTabContent(
             .fillMaxSize()
             .background(Background)
     ) {
-        when {
-            isLoading && visibleItems.isEmpty() -> {
+        when (contentState) {
+            NewsListState.Loading -> {
                 Column(
                     modifier = Modifier.fillMaxSize(),
                     horizontalAlignment = Alignment.CenterHorizontally,
@@ -143,7 +167,7 @@ fun NewsTabContent(
                     Text("뉴스 불러오는 중...", color = SecondaryText, fontSize = 14.sp)
                 }
             }
-            error != null && visibleItems.isEmpty() -> {
+            is NewsListState.Error -> {
                 Column(
                     modifier = Modifier.fillMaxSize(),
                     horizontalAlignment = Alignment.CenterHorizontally,
@@ -151,14 +175,14 @@ fun NewsTabContent(
                 ) {
                     Text("뉴스를 불러올 수 없습니다", color = PrimaryText, fontSize = 16.sp)
                     Spacer(modifier = Modifier.height(8.dp))
-                    Text(error, color = SecondaryText, fontSize = 12.sp)
+                    Text(contentState.message, color = SecondaryText, fontSize = 12.sp)
                     Spacer(modifier = Modifier.height(12.dp))
                     TextButton(onClick = onRetry) {
                         Text("다시 시도", color = Primary)
                     }
                 }
             }
-            visibleItems.isEmpty() -> {
+            NewsListState.Empty -> {
                 Column(
                     modifier = Modifier.fillMaxSize(),
                     horizontalAlignment = Alignment.CenterHorizontally,
@@ -173,14 +197,14 @@ fun NewsTabContent(
                     )
                 }
             }
-            else -> {
+            is NewsListState.Content -> {
                 LazyColumn(
                     state = listState,
                     modifier = Modifier.fillMaxSize(),
                     contentPadding = WindowInsets.navigationBars.asPaddingValues()
                 ) {
                     // 비구독자 안내 배너 (리스트 최상단)
-                    if (!isPremium) {
+                    if (contentState.showSubscriptionBanner) {
                         item(key = "non_premium_banner") {
                             NonPremiumNoticeBanner()
                             HorizontalDivider(
@@ -190,7 +214,7 @@ fun NewsTabContent(
                         }
                     }
 
-                    items(visibleItems, key = { it.id }) { item ->
+                    items(contentState.visibleItems, key = { it.id }) { item ->
                         NewsRow(
                             item = item,
                             refreshTrigger = refreshTrigger,
@@ -259,7 +283,7 @@ private fun NonPremiumNoticeBanner() {
             .padding(horizontal = 20.dp, vertical = 10.dp)
     ) {
         Text(
-            text = "구독 시 최신 뉴스·아침 보고서 전체 보기",
+            text = "구독 시 뉴스속보·환율 보고서 보기",
             color = PrimaryText,
             fontSize = 13.sp,
             lineHeight = 16.sp,

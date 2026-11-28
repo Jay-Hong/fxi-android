@@ -692,6 +692,22 @@
         "src/main/java/com/jay/fxi/ui/free/FreeComparisonAlertPreviewSection.kt": "42c1d4104b1ee68ab016398174c34c4f55ebc724f687f1b662c880365bfc3d08",
         "src/main/java/com/jay/fxi/ui/free/FreeComparisonAlertPreviewSheet.kt": "4ead13bde9dd321fc5555c4c3ec910945e57267be81fca6f42997c8265eeeb5c"
       }
+    },
+    {
+      "id": "S10-1",
+      "source_parent": "84c710d1b6d76ab8f56c04120a71f51ae617fa69",
+      "approval_record_sha256": "3cb46222283dd95946fff5bf708672f63588cd43e363e624c7daf675824daa54",
+      "changed": {
+        "src/main/java/com/jay/fxi/domain/model/NewsItem.kt": {
+          "from": "3eea71278290171ee6fd02d970aaf22403a07e4ce66fa8898187e25bd028884f",
+          "to": "b2c10ffca09d6e3bb189dbb87cd22c102c272fb40b4728a6f6884183d251ac4d"
+        },
+        "src/main/java/com/jay/fxi/ui/screen/NewsTabContent.kt": {
+          "from": "ef251c0dd3c1c33040e0254b9e14a3c1eb03bcced14e1a230f19ad7f1333827f",
+          "to": "b2964add71afb78fe5b988e994da414588d2481c648ac9b6fd17e522bc7aba2a"
+        }
+      },
+      "added": {}
     }
   ]
 }

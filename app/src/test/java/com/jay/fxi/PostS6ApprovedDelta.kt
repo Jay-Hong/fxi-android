@@ -26,7 +26,7 @@ import org.junit.Assert.assertNotNull
  */
 internal object PostS6ApprovedDelta {
     const val RESOURCE = "krx/post_s6/approved_delta.json"
-    const val APPROVED_SHA256 = "f1e0fc95a17b6814c0c48aae24f759c2f6caf6551c49e1e80ac1331babf1377e"
+    const val APPROVED_SHA256 = "57a09adf977a3010e963293f0642be3346138c171a912b0414d9e335c207423c"
     private const val BASE = S6Krx3bOffWiringContractTest.BASE
     private const val INVENTORY_SHA256 = "ee6b718c9ebc41f1e70a800bfb15d6073a66ef07041a2ba19b71e8a7a19d972f"
     private const val S64B_DELTA_SHA256 = "6a15c386a7c8220691c417e6e1f183d52614adb43b0dcd26ceb1bf712c61d536"
@@ -89,8 +89,12 @@ internal object PostS6ApprovedDelta {
      * - d3974388…: 70c903a0 PremiumTopicRoute.kt (S8-5b's change), no KRX including comments.
      * - 27796335…: f94795ef ComparisonAlertSection.kt (S9-2b's addition), no KRX including comments.
      * - 8875b396…: f94795ef PremiumTopicRoute.kt (S9-2b's change), no KRX including comments.
+     * - 3eea7127…: 84c710d1 NewsItem.kt (S10-1 predecessor), no KRX including comments.
+     * - ef251c0d…: 84c710d1 NewsTabContent.kt (S10-1 predecessor), no KRX including comments.
      */
     val NO_KRX_REVIEWED = setOf(
+        "3eea71278290171ee6fd02d970aaf22403a07e4ce66fa8898187e25bd028884f", // S10-1: NewsItem.kt
+        "ef251c0dd3c1c33040e0254b9e14a3c1eb03bcced14e1a230f19ad7f1333827f", // S10-1: NewsTabContent.kt
         "8fa175579559f8132f7a7ed82cfed5987dd5c1422429a4b19b8a2d6856dddb93", // S9-6: FreeSnapshotScreen.kt
         "f79454aa0551794e89d2443500bd554695c0aecc319735a4816007e19b91ebf0", // S9-6: FreeSnapshotUiState.kt
         // S9-5 comparison delivery predecessors.
