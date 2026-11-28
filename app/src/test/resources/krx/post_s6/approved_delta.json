@@ -708,6 +708,22 @@
         }
       },
       "added": {}
+    },
+    {
+      "id": "S10-4",
+      "source_parent": "2d93e723b4cfa2489f39b8f67d337075117bc480",
+      "approval_record_sha256": "3cb46222283dd95946fff5bf708672f63588cd43e363e624c7daf675824daa54",
+      "changed": {
+        "src/main/java/com/jay/fxi/data/entitlements/DeletionAdmissionStore.kt": {
+          "from": "56b34434ce4653c29e21e1e3bdb4059f444032e1ffd840f8ff4fe56b5144c1fd",
+          "to": "9d0e2246a94ed0132901679bbca5323427af5d1037ba5249b08ce467461a94e8"
+        }
+      },
+      "added": {
+        "src/main/java/com/jay/fxi/data/entitlements/DeletionRecordStore.kt": "93f105f3194cc5e07c7da27d5412c045853d54a520fbf2e9a784fdc6a8bc594b",
+        "src/main/java/com/jay/fxi/data/entitlements/DeletionRecord.kt": "8133dea4f91e9e1b29796362a4e08337d444ca8f4130de92fb3eef9cb2581d42",
+        "src/main/java/com/jay/fxi/data/entitlements/DeletionAuthorizationSource.kt": "d8d8e6d6bc42088098759f2e13a6a35286980a49fcaf1b3f4acae33d9effb71f"
+      }
     }
   ]
 }

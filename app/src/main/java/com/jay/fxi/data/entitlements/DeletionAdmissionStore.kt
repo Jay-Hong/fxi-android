@@ -2,6 +2,9 @@ package com.jay.fxi.data.entitlements
 
 import com.jay.fxi.data.auth.AuthIdentityFence
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /** Both phases block the owner's UID, including later auth generations of that UID. */
 internal enum class DeletionAdmissionPhase {
@@ -33,7 +36,15 @@ internal data class DeletionAdmissionRecord(
  * Concurrent writes retry through [AtomicReference]; reads are lock-free and see one complete
  * publication. Diagnostic snapshots are detached from the internal list.
  */
-internal class DeletionAdmissionStore {
+internal class DeletionAdmissionStore : DeletionProjection {
+    // The durable reader starts closed, including on an installation with no deletion file.
+    private val confirmed = MutableStateFlow<DeletionSnapshot>(DeletionSnapshot.Closed)
+    override val deletionSnapshot: StateFlow<DeletionSnapshot> = confirmed.asStateFlow()
+
+    override fun publishConfirmed(snapshot: DeletionSnapshot) {
+        confirmed.value = snapshot
+    }
+
     private val published = AtomicReference<List<DeletionAdmissionRecord>>(emptyList())
 
     /** A read-only diagnostic copy of one publication; later writes do not change it. */

@@ -26,7 +26,7 @@ import org.junit.Assert.assertNotNull
  */
 internal object PostS6ApprovedDelta {
     const val RESOURCE = "krx/post_s6/approved_delta.json"
-    const val APPROVED_SHA256 = "57a09adf977a3010e963293f0642be3346138c171a912b0414d9e335c207423c"
+    const val APPROVED_SHA256 = "b2f1ef8c40dcef67f510b841e42fd8b00f587da991c77a5e7974ef7e31ac733b"
     private const val BASE = S6Krx3bOffWiringContractTest.BASE
     private const val INVENTORY_SHA256 = "ee6b718c9ebc41f1e70a800bfb15d6073a66ef07041a2ba19b71e8a7a19d972f"
     private const val S64B_DELTA_SHA256 = "6a15c386a7c8220691c417e6e1f183d52614adb43b0dcd26ceb1bf712c61d536"
@@ -194,9 +194,36 @@ internal object PostS6ApprovedDelta {
      * - S8-6 (`R4c/S8/user_decision_s8_6.r1.md` 2b73b32b…, the user's decision delegated to Claude·Codex, both A):
      *   FXiMessagingService.kt, its third link (the exchange source push before the emit, published only while admitted), and
      *   MainActivity.kt, its second link (the OFF parser's source tap consumed first).
+     * - S10-4 (R4c/S10/s10_456/user_decision_s10_456_forbidden.r1.md): confirmed projection in
+     *   DeletionAdmissionStore.kt. The predecessor and successor have no KRX lines, comments included.
      */
     class CoreException(val unitId: String, val sourceParent: String, val approvalRecordSha256: String, val path: String,
         val from: String, val to: String, val krxLinesSha256: String)
+
+    // The unit manifest names the S10 scope; the path exceptions name the subsequent forbidden-path decision.
+    private const val S104_PARENT = "2d93e723b4cfa2489f39b8f67d337075117bc480"
+    private const val S10_SCOPE = "3cb46222283dd95946fff5bf708672f63588cd43e363e624c7daf675824daa54"
+    private const val S104_DECISION = "1631bccffedeab2d3efa0ed24182d0d319f773fe39c96028798aee756ffa1cdb"
+
+    private fun approvalMatches(id: String, manifestRecord: String, exceptionRecord: String) =
+        if (id == "S10-4") manifestRecord == S10_SCOPE && exceptionRecord == S104_DECISION
+        else manifestRecord == exceptionRecord
+
+    data class AddedException(val unitId: String, val sourceParent: String, val approvalRecordSha256: String,
+        val path: String, val to: String) {
+        fun matches(id: String, unit: JsonObject, candidate: String, hash: String, existed: Boolean): Boolean =
+            !existed && id == unitId && sourceParent == unit.string("source_parent") && candidate == path &&
+                hash == to && approvalMatches(id, unit.string("approval_record_sha256"), approvalRecordSha256)
+    }
+
+    val ADDED_EXCEPTIONS = setOf(
+        AddedException("S10-4", S104_PARENT, S104_DECISION, BASE + "data/entitlements/DeletionRecordStore.kt",
+            "93f105f3194cc5e07c7da27d5412c045853d54a520fbf2e9a784fdc6a8bc594b"),
+        AddedException("S10-4", S104_PARENT, S104_DECISION, BASE + "data/entitlements/DeletionRecord.kt",
+            "8133dea4f91e9e1b29796362a4e08337d444ca8f4130de92fb3eef9cb2581d42"),
+        AddedException("S10-4", S104_PARENT, S104_DECISION, BASE + "data/entitlements/DeletionAuthorizationSource.kt",
+            "d8d8e6d6bc42088098759f2e13a6a35286980a49fcaf1b3f4acae33d9effb71f")
+    )
 
     val CORE_EXCEPTIONS: Set<CoreException> = setOf(
         CoreException(
@@ -279,6 +306,15 @@ internal object PostS6ApprovedDelta {
             from = "3328908334f4388686891812483df4fe7ba3d043aa7b6f969850c6d670230de5",
             to = "17bcaee7748430831b3d4f9e3962bb131444d2c56f7831b80d9117cfa16fb9fb",
             krxLinesSha256 = "e61ab21d19206fde24d0b2a8d74e0e75def7397c1ac1d3be33f8514b07b725aa"
+        ),
+        CoreException(
+            unitId = "S10-4",
+            sourceParent = S104_PARENT,
+            approvalRecordSha256 = S104_DECISION,
+            path = BASE + "data/entitlements/DeletionAdmissionStore.kt",
+            from = "56b34434ce4653c29e21e1e3bdb4059f444032e1ffd840f8ff4fe56b5144c1fd",
+            to = "9d0e2246a94ed0132901679bbca5323427af5d1037ba5249b08ce467461a94e8",
+            krxLinesSha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         )
     )
 
@@ -286,7 +322,7 @@ internal object PostS6ApprovedDelta {
     private fun coreException(id: String, unit: JsonObject, path: String, entry: JsonObject?): CoreException? =
         CORE_EXCEPTIONS.firstOrNull {
             it.unitId == id && it.sourceParent == unit.string("source_parent") &&
-                it.approvalRecordSha256 == unit.string("approval_record_sha256") && it.path == path &&
+                approvalMatches(id, unit.string("approval_record_sha256"), it.approvalRecordSha256) && it.path == path &&
                 entry != null && entry.keys == setOf("from", "to") && entry.string("from") == it.from && entry.string("to") == it.to
         }
 
@@ -440,7 +476,10 @@ internal object PostS6ApprovedDelta {
             if (changed.isEmpty() && added.isEmpty()) out += "unit-empty $id"
             for (path in changed.keys + added.keys) {
                 if (!pathForm(path)) out += "path-form $path"
-                val excepted = path in changed && coreException(id, unit, path, changed[path] as? JsonObject) != null
+                val excepted = when (path) {
+                    in changed -> coreException(id, unit, path, changed[path] as? JsonObject) != null
+                    else -> ADDED_EXCEPTIONS.any { it.matches(id, unit, path, added.string(path), path in current) }
+                }
                 if ((path in FORBIDDEN_PATHS || FORBIDDEN_PREFIXES.any { path.startsWith(it) }) && !excepted) out += "forbidden $path"
             }
             if ((changed.keys intersect added.keys).isNotEmpty()) out += "overlap ${changed.keys intersect added.keys}"
